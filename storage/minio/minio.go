@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -100,9 +101,41 @@ func (svc *Service) Initialize() error {
 	return nil
 }
 
+// 默认分片大小 即使没有成功获取到文件大小也要防止源码包中直接使用 5TiB/10000 = 528MB 进行预分配内存
+const objectPartSize = 16 * 1024 * 1024
+
+// readerSize 获取reader剩余可读取的大小，无法获取时返回-1
+func readerSize(file io.Reader) int64 {
+	// 获取文件或流的类型
+	switch r := file.(type) {
+	case interface{ Len() int }:
+		// bytes.Reader、bytes.Buffer、strings.Reader等流的情况直接返回流的长度
+		return int64(r.Len())
+	case interface {
+		// *os.File的情况(可以正常执行Stat和Seek)
+		Stat() (os.FileInfo, error)
+		io.Seeker
+	}:
+		// 获取文件状态
+		fi, err := r.Stat()
+		// 获取文件状态失败或不是普通文件的情况
+		if err != nil || !fi.Mode().IsRegular() {
+			return -1
+		}
+		// 文件读取指针位置失败
+		offset, err := r.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return -1
+		}
+		// 获取文件大小与当前读取位置的差获取上传大小
+		return fi.Size() - offset
+	}
+	return -1
+}
+
 // NewObject 基础的创建一个文件对象
 func (svc *Service) NewObject(objectName string, file io.Reader, contentType string) (*storage.ObjectInfo, error) {
-	info, err := svc.client.PutObject(context.Background(), svc.BucketName, objectName, file, -1, minio.PutObjectOptions{ContentType: contentType})
+	info, err := svc.client.PutObject(context.Background(), svc.BucketName, objectName, file, readerSize(file), minio.PutObjectOptions{ContentType: contentType, PartSize: objectPartSize})
 	if err != nil {
 		log.Errorf("minio.PutObject failed: %v", err)
 		return nil, err
